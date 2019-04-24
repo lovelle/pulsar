@@ -102,7 +102,7 @@ public class ConsumerImpl<T> extends ConsumerBase<T> implements ConnectionHandle
     protected volatile MessageId lastDequeuedMessage = MessageId.earliest;
     private volatile MessageId lastMessageIdInBroker = MessageId.earliest;
 
-    private long subscribeTimeout;
+    private final long subscribeTimeout;
     private final int partitionIndex;
 
     private final int receiverQueueRefillThreshold;
@@ -287,9 +287,7 @@ public class ConsumerImpl<T> extends ConsumerBase<T> implements ConnectionHandle
             cnx.sendRequestWithId(unsubscribe, requestId).thenRun(() -> {
                 cnx.removeConsumer(consumerId);
                 unAckedMessageTracker.close();
-                if (possibleSendToDeadLetterTopicMessages != null) {
-                    possibleSendToDeadLetterTopicMessages.clear();
-                }
+                clearDeadLetterTopicMessages();
                 client.cleanupConsumer(ConsumerImpl.this);
                 log.info("[{}][{}] Successfully unsubscribed from topic", topic, subscription);
                 setState(State.Closed);
@@ -374,8 +372,8 @@ public class ConsumerImpl<T> extends ConsumerBase<T> implements ConnectionHandle
         }
     }
 
-    boolean markAckForBatchMessage(BatchMessageIdImpl batchMessageId, AckType ackType,
-                                   Map<String,Long> properties) {
+    private boolean markAckForBatchMessage(BatchMessageIdImpl batchMessageId, AckType ackType,
+                                           Map<String, Long> properties) {
         boolean isAllMsgsAcked;
         if (ackType == AckType.Individual) {
             isAllMsgsAcked = batchMessageId.ackIndividual();
@@ -498,9 +496,7 @@ public class ConsumerImpl<T> extends ConsumerBase<T> implements ConnectionHandle
         synchronized (this) {
             currentSize = incomingMessages.size();
             startMessageId = clearReceiverQueue();
-            if (possibleSendToDeadLetterTopicMessages != null) {
-                possibleSendToDeadLetterTopicMessages.clear();
-            }
+            clearDeadLetterTopicMessages();
         }
 
         boolean isDurable = subscriptionMode == SubscriptionMode.Durable;
@@ -653,9 +649,7 @@ public class ConsumerImpl<T> extends ConsumerBase<T> implements ConnectionHandle
 
         if (getState() == State.Closing || getState() == State.Closed) {
             unAckedMessageTracker.close();
-            if (possibleSendToDeadLetterTopicMessages != null) {
-                possibleSendToDeadLetterTopicMessages.clear();
-            }
+            clearDeadLetterTopicMessages();
             return CompletableFuture.completedFuture(null);
         }
 
@@ -663,9 +657,7 @@ public class ConsumerImpl<T> extends ConsumerBase<T> implements ConnectionHandle
             log.info("[{}] [{}] Closed Consumer (not connected)", topic, subscription);
             setState(State.Closed);
             unAckedMessageTracker.close();
-            if (possibleSendToDeadLetterTopicMessages != null) {
-                possibleSendToDeadLetterTopicMessages.clear();
-            }
+            clearDeadLetterTopicMessages();
             client.cleanupConsumer(this);
             return CompletableFuture.completedFuture(null);
         }
@@ -702,9 +694,7 @@ public class ConsumerImpl<T> extends ConsumerBase<T> implements ConnectionHandle
         log.info("[{}] [{}] Closed consumer", topic, subscription);
         setState(State.Closed);
         unAckedMessageTracker.close();
-        if (possibleSendToDeadLetterTopicMessages != null) {
-            possibleSendToDeadLetterTopicMessages.clear();
-        }
+        clearDeadLetterTopicMessages();
         closeFuture.complete(null);
         client.cleanupConsumer(this);
         // fail all pending-receive futures to notify application
@@ -751,7 +741,6 @@ public class ConsumerImpl<T> extends ConsumerBase<T> implements ConnectionHandle
         }
 
         MessageMetadata msgMetadata = null;
-        ByteBuf payload = headersAndPayload;
 
         if (!verifyChecksum(headersAndPayload, messageId)) {
             // discard message with checksum error
@@ -760,7 +749,7 @@ public class ConsumerImpl<T> extends ConsumerBase<T> implements ConnectionHandle
         }
 
         try {
-            msgMetadata = Commands.parseMessageMetadata(payload);
+            msgMetadata = Commands.parseMessageMetadata(headersAndPayload);
         } catch (Throwable t) {
             discardCorruptedMessage(messageId, cnx, ValidationError.ChecksumMismatch);
             return;
@@ -772,14 +761,14 @@ public class ConsumerImpl<T> extends ConsumerBase<T> implements ConnectionHandle
         if (acknowledgmentsGroupingTracker.isDuplicate(msgId)) {
             if (log.isDebugEnabled()) {
                 log.debug("[{}][{}] Ignoring message as it was already being acked earlier by same consumer {}/{}",
-                        topic, subscription, msgId);
+                        topic, subscription, msgId, numMessages);
             }
 
             increaseAvailablePermits(cnx, numMessages);
             return;
         }
 
-        ByteBuf decryptedPayload = decryptPayloadIfNeeded(messageId, msgMetadata, payload, cnx);
+        ByteBuf decryptedPayload = decryptPayloadIfNeeded(messageId, msgMetadata, headersAndPayload, cnx);
 
         boolean isMessageUndecryptable = isMessageUndecryptable(msgMetadata);
 
@@ -1154,8 +1143,7 @@ public class ConsumerImpl<T> extends ConsumerBase<T> implements ConnectionHandle
         }
 
         try {
-            ByteBuf uncompressedPayload = codec.decode(payload, uncompressedSize);
-            return uncompressedPayload;
+            return codec.decode(payload, uncompressedSize);
         } catch (IOException e) {
             log.error("[{}][{}] Failed to decompress message with {} at {}: {}", topic, subscription, compressionType,
                     messageId, e.getMessage(), e);
@@ -1425,10 +1413,6 @@ public class ConsumerImpl<T> extends ConsumerBase<T> implements ConnectionHandle
 
     public boolean hasMessageAvailable() throws PulsarClientException {
         try {
-            if (hasMoreMessages(lastMessageIdInBroker, lastDequeuedMessage)) {
-                return true;
-            }
-
             return hasMessageAvailableAsync().get();
         } catch (ExecutionException | InterruptedException e) {
             throw new PulsarClientException(e);
@@ -1458,14 +1442,13 @@ public class ConsumerImpl<T> extends ConsumerBase<T> implements ConnectionHandle
     }
 
     private boolean hasMoreMessages(MessageId lastMessageIdInBroker, MessageId lastDequeuedMessage) {
-        if (lastMessageIdInBroker.compareTo(lastDequeuedMessage) > 0 &&
-                ((MessageIdImpl)lastMessageIdInBroker).getEntryId() != -1) {
+        final int comparator = lastMessageIdInBroker.compareTo(lastDequeuedMessage);
+        if (comparator > 0 && ((MessageIdImpl)lastMessageIdInBroker).getEntryId() != -1) {
             return true;
-        } else {
-            // Make sure batching message can be read completely.
-            return lastMessageIdInBroker.compareTo(lastDequeuedMessage) == 0
-                && incomingMessages.size() > 0;
         }
+
+        // Make sure batching message can be read completely.
+        return comparator == 0 && incomingMessages.size() > 0;
     }
 
     CompletableFuture<MessageId> getLastMessageIdAsync() {
@@ -1608,6 +1591,12 @@ public class ConsumerImpl<T> extends ConsumerBase<T> implements ConnectionHandle
     @Override
     public ConsumerStats getStats() {
         return stats;
+    }
+
+    private void clearDeadLetterTopicMessages() {
+        if (possibleSendToDeadLetterTopicMessages != null) {
+            possibleSendToDeadLetterTopicMessages.clear();
+        }
     }
 
     void setTerminated() {
